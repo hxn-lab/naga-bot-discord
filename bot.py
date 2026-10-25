@@ -9,13 +9,14 @@ import threading
 import random
 import re
 import hmac
+import secrets
 import logging
 import subprocess
 from datetime import timedelta
 from collections import defaultdict, deque
 
 def _ensure_packages():
-    required = {"aiohttp": "aiohttp", "discord": "discord.py", "dotenv": "python-dotenv", "groq": "groq"}
+    required = {"aiohttp": "aiohttp", "discord": "discord.py", "dotenv": "python-dotenv", "groq": "groq", "pymongo": "pymongo"}
     missing = []
     for module, package in required.items():
         try:
@@ -57,10 +58,7 @@ async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
 def _log_access_allowed(request) -> bool:
-    token = os.getenv("LOG_WEB_TOKEN", "")
-    if not token:
-        return False
-    return hmac.compare_digest(request.query.get("token", "").encode(), token.encode())
+    return hmac.compare_digest(request.query.get("token", "").encode(), LOG_WEB_TOKEN.encode())
 
 LOG_PAGE_HTML = """<!DOCTYPE html>
 <html lang="vi">
@@ -91,7 +89,7 @@ async function load() {
       return;
     }
     logEl.textContent = await res.text();
-    statusEl.textContent = "Updated " + new Date().toLocaleTimeString() + " - " + logEl.textContent.split("\n").length + " lines";
+    statusEl.textContent = "Updated " + new Date().toLocaleTimeString() + " - " + logEl.textContent.split("\\n").length + " lines";
     if (followEl.checked) window.scrollTo(0, document.body.scrollHeight);
   } catch (err) {
     statusEl.textContent = "Connection error: " + err;
@@ -107,12 +105,12 @@ setInterval(load, 3000);
 
 async def handle_logs_page(request):
     if not _log_access_allowed(request):
-        return web.Response(status=403, text="Forbidden: set LOG_WEB_TOKEN in the environment and open /logs?token=YOUR_TOKEN")
+        return web.Response(status=403, text="Forbidden: missing or wrong token. Open /logs?token=YOUR_TOKEN")
     return web.Response(text=LOG_PAGE_HTML, content_type="text/html", headers={"Cache-Control": "no-store"})
 
 async def handle_logs_raw(request):
     if not _log_access_allowed(request):
-        return web.Response(status=403, text="Forbidden: set LOG_WEB_TOKEN in the environment and pass ?token=YOUR_TOKEN")
+        return web.Response(status=403, text="Forbidden: missing or wrong token")
     return web.Response(text="\n".join(web_log_buffer.records), content_type="text/plain", headers={"Cache-Control": "no-store"})
 
 async def start_web_server():
@@ -145,18 +143,21 @@ async def start_web_server():
     bot._web_server_started = True
     web_log.info("Web server running on port %s", port)
     web_log.info("Listening on http://%s:%s/ (health check route: GET /)", host, port)
-    if os.getenv("LOG_WEB_TOKEN"):
+    if LOG_WEB_TOKEN_FROM_ENV:
         web_log.info("Web log viewer enabled at /logs?token=<LOG_WEB_TOKEN> (raw text: /logs/raw)")
     else:
-        web_log.warning("Web log viewer disabled: set LOG_WEB_TOKEN in the environment to enable /logs")
+        web_log.warning("LOG_WEB_TOKEN not set, generated a temporary token. Open /logs?token=%s (changes on every restart)", LOG_WEB_TOKEN)
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from groq import Groq
+from pymongo import MongoClient
 
 load_dotenv()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_WEB_TOKEN_FROM_ENV = bool(os.getenv("LOG_WEB_TOKEN"))
+LOG_WEB_TOKEN = os.getenv("LOG_WEB_TOKEN") or secrets.token_urlsafe(16)
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s",
@@ -182,6 +183,27 @@ class WebLogBuffer(logging.Handler):
 web_log_buffer = WebLogBuffer()
 web_log_buffer.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s", "%Y-%m-%d %H:%M:%S"))
 logging.getLogger().addHandler(web_log_buffer)
+
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_RETRY_COOLDOWN_SECONDS = 30
+db = None
+economy_col = None
+command_stats_col = None
+state_col = None
+
+if MONGO_URI:
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+        mongo_client.admin.command("ping")
+        db = mongo_client["naga_bot_db"]
+        economy_col = db["economy"]
+        command_stats_col = db["command_stats"]
+        state_col = db["state"]
+        log.info("✅ Kết nối MongoDB Atlas thành công!")
+    except Exception as e:
+        log.error("❌ Lỗi kết nối MongoDB: %s", e)
+else:
+    log.warning("⚠️ MONGO_URI chưa được cấu hình — dữ liệu economy chỉ lưu ở file cục bộ.")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -587,9 +609,147 @@ def _save_economy_to_disk(data: dict) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, ECONOMY_FILE)
+    _sync_users_to_mongodb(economy_col, data)
 
 
 economy = _load_economy()
+
+_mongo_synced: dict[tuple[str, str], str] = {}
+_mongo_retry_after = 0.0
+_mongo_ready = False
+_STATE_DOC_NAMES = {MARKET_FILE: "market", GIVEAWAYS_FILE: "giveaways", TRANSACTIONS_FILE: "transactions"}
+
+
+def _fingerprint(payload) -> str:
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _mongo_available() -> bool:
+    return economy_col is not None and _mongo_ready and time.time() >= _mongo_retry_after
+
+
+def _mongo_pause() -> None:
+    global _mongo_retry_after
+    _mongo_retry_after = time.time() + MONGO_RETRY_COOLDOWN_SECONDS
+    log.warning("MongoDB sync tạm dừng %ss do lỗi, dữ liệu vẫn được lưu ở file cục bộ", MONGO_RETRY_COOLDOWN_SECONDS)
+
+
+def sync_user_to_mongodb(user_id: str, user_dict: dict, col=None) -> bool:
+    col = economy_col if col is None else col
+    if col is None:
+        return False
+    try:
+        col.replace_one({"_id": str(user_id)}, user_dict, upsert=True)
+        return True
+    except Exception as e:
+        log.error("⚠️ Lỗi lưu %s/%s lên MongoDB: %s", col.name, user_id, e)
+        return False
+
+
+def _sync_users_to_mongodb(col, data: dict) -> None:
+    if not _mongo_available():
+        return
+    synced = 0
+    for user_id, user_dict in list(data.items()):
+        if not isinstance(user_dict, dict):
+            continue
+        try:
+            fingerprint = _fingerprint(user_dict)
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        key = (col.name, str(user_id))
+        if _mongo_synced.get(key) == fingerprint:
+            continue
+        if not sync_user_to_mongodb(user_id, user_dict, col):
+            _mongo_pause()
+            return
+        _mongo_synced[key] = fingerprint
+        synced += 1
+    if synced:
+        log.info("📤 Đã đồng bộ %s mục lên MongoDB (%s)", synced, col.name)
+
+
+def _sync_state_to_mongodb(name: str, payload) -> None:
+    if not _mongo_available():
+        return
+    try:
+        fingerprint = _fingerprint(payload)
+    except (TypeError, ValueError, RuntimeError):
+        return
+    key = (state_col.name, name)
+    if _mongo_synced.get(key) == fingerprint:
+        return
+    if not sync_user_to_mongodb(name, {"data": payload}, state_col):
+        _mongo_pause()
+        return
+    _mongo_synced[key] = fingerprint
+    log.info("📤 Đã đồng bộ %s lên MongoDB", name)
+
+
+def _sync_file_to_mongodb(path: str, data) -> None:
+    if path == COMMAND_STATS_FILE and isinstance(data, dict):
+        _sync_users_to_mongodb(command_stats_col, data)
+    elif path in _STATE_DOC_NAMES:
+        _sync_state_to_mongodb(_STATE_DOC_NAMES[path], data)
+
+
+def _fetch_mongo_data() -> dict | None:
+    try:
+        return {
+            "economy": list(economy_col.find({})),
+            "command_stats": list(command_stats_col.find({})),
+            "state": {doc["_id"]: doc.get("data") for doc in state_col.find({})},
+        }
+    except Exception as e:
+        log.error("⚠️ Lỗi tải dữ liệu từ MongoDB: %s", e)
+        return None
+
+
+def _apply_users_from_mongodb(col, records: list, target: dict) -> None:
+    for item in records:
+        user_id = str(item["_id"])
+        user_data = {k: v for k, v in item.items() if k != "_id"}
+        target[user_id] = user_data
+        _mongo_synced[(col.name, user_id)] = _fingerprint(user_data)
+
+
+def _apply_mongo_data(data: dict) -> None:
+    _apply_users_from_mongodb(economy_col, data["economy"], economy)
+    _apply_users_from_mongodb(command_stats_col, data["command_stats"], command_stats)
+    state = data["state"]
+    market = state.get("market")
+    if isinstance(market, dict) and "last_update" in market and "seed_prices" in market:
+        market_data.clear()
+        market_data.update(market)
+        _mongo_synced[(state_col.name, "market")] = _fingerprint(market_data)
+    giveaways = state.get("giveaways")
+    if isinstance(giveaways, dict):
+        active_giveaways.clear()
+        active_giveaways.update(giveaways)
+        _mongo_synced[(state_col.name, "giveaways")] = _fingerprint(active_giveaways)
+    transactions = state.get("transactions")
+    if isinstance(transactions, list):
+        transactions_log[:] = transactions
+        _mongo_synced[(state_col.name, "transactions")] = _fingerprint(transactions_log)
+
+
+async def load_data_from_mongodb() -> bool:
+    global _mongo_ready
+    if economy_col is None:
+        return False
+    data = await asyncio.to_thread(_fetch_mongo_data)
+    if data is None:
+        return False
+    async with economy_lock:
+        _apply_mongo_data(data)
+        _mongo_ready = True
+        await asyncio.to_thread(_save_economy_to_disk, economy)
+    await asyncio.to_thread(_save_json_file, COMMAND_STATS_FILE, command_stats)
+    await asyncio.to_thread(_save_json_file, MARKET_FILE, market_data)
+    await asyncio.to_thread(_save_json_file, GIVEAWAYS_FILE, active_giveaways)
+    await asyncio.to_thread(_save_json_file, TRANSACTIONS_FILE, transactions_log)
+    log.info("📦 Đã đồng bộ từ MongoDB về bộ nhớ: %s tài khoản, %s mục command_stats, %s tài liệu trạng thái", len(data["economy"]), len(data["command_stats"]), len(data["state"]))
+    return True
 
 
 def get_account(user_id: int) -> dict:
@@ -678,6 +838,7 @@ def _save_json_file(path: str, data) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
+    _sync_file_to_mongodb(path, data)
 
 
 command_stats = _load_json_file(COMMAND_STATS_FILE)
@@ -911,6 +1072,17 @@ async def on_ready():
     discord_log.info("Connected to %s guild(s) | %s cached user(s) | latency %sms", len(bot.guilds), len(bot.users), round(bot.latency * 1000))
     for guild in bot.guilds:
         discord_log.info("Guild: %s (ID: %s) | members: %s", guild.name, guild.id, guild.member_count)
+
+    if economy_col is not None and not getattr(bot, "_mongo_loaded", False):
+        for attempt in range(1, 4):
+            if await load_data_from_mongodb():
+                bot._mongo_loaded = True
+                break
+            log.warning("Tải dữ liệu từ MongoDB thất bại (lần %s/3)", attempt)
+            if attempt < 3:
+                await asyncio.sleep(5)
+        else:
+            log.error("Không tải được dữ liệu từ MongoDB, đồng bộ lên cloud bị tắt để tránh ghi đè dữ liệu cũ")
 
     if not getattr(bot, "_terminal_thread_started", False):
         bot._terminal_thread_started = True
