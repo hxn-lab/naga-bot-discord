@@ -1,0 +1,120 @@
+{
+  "last_update": 1791295354.03903,
+  "hoe_price": 30.77,
+  "seed_prices": {
+    "common": 0.44,
+    "uncommon": 2.19,
+    "rare": 5.88,
+    "epic": 13.93,
+    "legendary": 35.68
+  },
+  "crop_prices": {
+    "common": 0.7,
+    "uncommon": 3.92,
+    "rare": 8.18,
+    "epic": 19.4,
+    "legendary": 61.78
+  },
+  "pickaxe_prices": {
+    "wooden": 30.61,
+    "stone": 103.15,
+    "iron": 315.75,
+    "gold": 1097.82,
+    "diamond": 2765.86
+  },
+  "current": {
+    "hoe": 32.01,
+    "water": 2.0,
+    "seeds": {
+      "common": 4.31,
+      "uncommon": 17.09,
+      "rare": 37.51,
+      "epic": 92.75,
+      "legendary": 307.47
+    },
+    "ores": {
+      "copper": 2.98,
+      "coal": 5.22,
+      "iron": 10.59,
+      "gold": 26.73,
+      "diamond": 89.14,
+      "ruby": 137.69,
+      "emerald": 241.04
+    },
+    "sell_ratio": 1.79
+  },
+  "history": [
+    {
+      "time": 1790389750.7631373,
+      "prices": {
+        "hoe": 26.94,
+        "water": 2.0,
+        "seeds": {
+          "common": 5.62,
+          "uncommon": 14.51,
+          "rare": 34.91,
+          "epic": 87.27,
+          "legendary": 314.54
+        },
+        "ores": {
+          "copper": 3.12,
+          "coal": 4.49,
+          "iron": 9.13,
+          "gold": 23.64,
+          "diamond": 79.41,
+          "ruby": 166.81,
+          "emerald": 224.0
+        },
+        "sell_ratio": 1.51
+      }
+    },
+    {
+      "time": 1790389888.4963164,
+      "prices": {
+        "hoe": 33.74,
+        "water": 2.0,
+        "seeds": {
+          "common": 5.24,
+          "uncommon": 13.38,
+          "rare": 38.13,
+          "epic": 100.58,
+          "legendary": 284.65
+        },
+        "ores": {
+          "copper": 3.25,
+          "coal": 5.53,
+          "iron": 8.78,
+          "gold": 25.6,
+          "diamond": 73.97,
+          "ruby": 153.81,
+          "emerald": 236.85
+        },
+        "sell_ratio": 1.45
+      }
+    },
+    {
+      "time": 1790389924.7466877,
+      "prices": {
+        "hoe": 32.01,
+        "water": 2.0,
+        "seeds": {
+          "common": 4.31,
+          "uncommon": 17.09,
+          "rare": 37.51,
+          "epic": 92.75,
+          "legendary": 307.47
+        },
+        "ores": {
+          "copper": 2.98,
+          "coal": 5.22,
+          "iron": 10.59,
+          "gold": 26.73,
+          "diamond": 89.14,
+          "ruby": 137.69,
+          "emerald": 241.04
+        },
+        "sell_ratio": 1.79
+      }
+    }
+  ]
+}

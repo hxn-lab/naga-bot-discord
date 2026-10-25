@@ -1,0 +1,114 @@
+{
+  "1436377451482583122": {
+    "help": 34,
+    "lang": 5,
+    "addmoney": 6,
+    "linkwallet": 2,
+    "setlevel": 2,
+    "setcreditscore": 1,
+    "shop": 4,
+    "buy": 11,
+    "pay": 5,
+    "removemoney": 4,
+    "bank": 16,
+    "deposit": 2,
+    "ping": 3,
+    "loan": 1,
+    "mine": 5,
+    "profile": 3,
+    "rank": 3,
+    "leaderboard": 17,
+    "quests": 2,
+    "daily": 1,
+    "adminlist": 2,
+    "economycheck": 3,
+    "giveaway": 22,
+    "plant": 3,
+    "bag": 4,
+    "giveitem": 7,
+    "craft": 6,
+    "wheel": 11,
+    "water": 3,
+    "farm": 1,
+    "pool": 6,
+    "say": 8,
+    "reset": 3,
+    "reloadeconomy": 3,
+    "ban": 1,
+    "duco": 1,
+    "harvest": 1
+  },
+  "1418291572616986787": {
+    "daily": 5,
+    "linkwallet": 2,
+    "balance": 5,
+    "quests": 2,
+    "help": 6,
+    "bank": 10,
+    "creditscore": 1,
+    "giveaway": 3,
+    "leaderboard": 1,
+    "deposit": 1,
+    "duco": 1,
+    "pool": 1
+  },
+  "1168613631324332082": {
+    "balance": 5,
+    "linkwallet": 2,
+    "bank": 4,
+    "wheel": 1,
+    "gamble": 2,
+    "help": 2,
+    "dice": 2,
+    "pay": 4,
+    "slots": 1
+  },
+  "1286698995028070464": {
+    "help": 5,
+    "quests": 2,
+    "mine": 1,
+    "daily": 2,
+    "linkwallet": 1,
+    "bank": 2,
+    "giveaway": 7
+  },
+  "819292466225217558": {
+    "balance": 1
+  },
+  "users": {
+    "1436377451482583122": {
+      "help": 1
+    }
+  },
+  "commands": {
+    "help": 1
+  },
+  "1490968447818137650": {
+    "daily": 2,
+    "linkwallet": 1,
+    "say": 1
+  },
+  "1428001588659752981": {
+    "mutebot": 3,
+    "daily": 1,
+    "help": 5,
+    "addmoney": 4,
+    "balance": 3,
+    "linkwallet": 1,
+    "duco": 1,
+    "profile": 1,
+    "giveaway": 6,
+    "say": 4,
+    "pay": 1,
+    "removemoney": 1
+  },
+  "1533447435890855999": {
+    "help": 1,
+    "linkwallet": 1,
+    "daily": 1,
+    "gamble": 1
+  },
+  "694982086884327444": {
+    "help": 1
+  }
+}
