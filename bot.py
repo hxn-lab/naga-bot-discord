@@ -8,6 +8,7 @@ import asyncio
 import threading
 import random
 import re
+import hmac
 import logging
 import subprocess
 from datetime import timedelta
@@ -34,19 +35,85 @@ async def access_log_middleware(request, handler):
     started = time.perf_counter()
     remote = request.headers.get("X-Forwarded-For", request.remote)
     agent = request.headers.get("User-Agent", "unknown")
+    quiet = request.path.startswith("/logs")
     try:
         response = await handler(request)
     except web.HTTPException as e:
-        web_log.warning("%s %s -> %s %s | from %s | UA: %s | %.1f ms", request.method, request.path_qs, e.status, e.reason, remote, agent, (time.perf_counter() - started) * 1000)
+        web_log.warning("%s %s -> %s %s | from %s | UA: %s | %.1f ms", request.method, request.path, e.status, e.reason, remote, agent, (time.perf_counter() - started) * 1000)
         raise
     except Exception:
-        web_log.exception("%s %s -> 500 | from %s | UA: %s | %.1f ms", request.method, request.path_qs, remote, agent, (time.perf_counter() - started) * 1000)
+        web_log.exception("%s %s -> 500 | from %s | UA: %s | %.1f ms", request.method, request.path, remote, agent, (time.perf_counter() - started) * 1000)
         raise
-    web_log.info("%s %s -> %s | %s bytes | from %s | UA: %s | %.1f ms", request.method, request.path_qs, response.status, response.content_length, remote, agent, (time.perf_counter() - started) * 1000)
+    if response.status >= 400:
+        level = logging.WARNING
+    elif quiet:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    web_log.log(level, "%s %s -> %s | %s bytes | from %s | UA: %s | %.1f ms", request.method, request.path, response.status, response.content_length, remote, agent, (time.perf_counter() - started) * 1000)
     return response
 
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
+
+def _log_access_allowed(request) -> bool:
+    token = os.getenv("LOG_WEB_TOKEN", "")
+    if not token:
+        return False
+    return hmac.compare_digest(request.query.get("token", "").encode(), token.encode())
+
+LOG_PAGE_HTML = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot logs</title>
+<style>
+body { margin: 0; background: #0d1117; color: #c9d1d9; font-family: ui-monospace, Consolas, monospace; }
+header { position: sticky; top: 0; background: #161b22; padding: 8px 12px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #30363d; }
+header span { flex: 1; }
+pre { margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.45; }
+button { background: #238636; color: #fff; border: 0; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header><span id="status">Connecting...</span><label><input type="checkbox" id="follow" checked> Auto-scroll</label><button id="refresh">Refresh</button></header>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const followEl = document.getElementById("follow");
+async function load() {
+  try {
+    const res = await fetch("/logs/raw" + location.search, { cache: "no-store" });
+    if (!res.ok) {
+      statusEl.textContent = "Error " + res.status + ": " + (await res.text());
+      return;
+    }
+    logEl.textContent = await res.text();
+    statusEl.textContent = "Updated " + new Date().toLocaleTimeString() + " - " + logEl.textContent.split("\n").length + " lines";
+    if (followEl.checked) window.scrollTo(0, document.body.scrollHeight);
+  } catch (err) {
+    statusEl.textContent = "Connection error: " + err;
+  }
+}
+document.getElementById("refresh").addEventListener("click", load);
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>
+"""
+
+async def handle_logs_page(request):
+    if not _log_access_allowed(request):
+        return web.Response(status=403, text="Forbidden: set LOG_WEB_TOKEN in the environment and open /logs?token=YOUR_TOKEN")
+    return web.Response(text=LOG_PAGE_HTML, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+async def handle_logs_raw(request):
+    if not _log_access_allowed(request):
+        return web.Response(status=403, text="Forbidden: set LOG_WEB_TOKEN in the environment and pass ?token=YOUR_TOKEN")
+    return web.Response(text="\n".join(web_log_buffer.records), content_type="text/plain", headers={"Cache-Control": "no-store"})
 
 async def start_web_server():
     if getattr(bot, "_web_server_started", False):
@@ -63,6 +130,8 @@ async def start_web_server():
     try:
         app = web.Application(middlewares=[access_log_middleware])
         app.router.add_get("/", handle_ping)
+        app.router.add_get("/logs", handle_logs_page)
+        app.router.add_get("/logs/raw", handle_logs_raw)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, host, port)
@@ -76,6 +145,10 @@ async def start_web_server():
     bot._web_server_started = True
     web_log.info("Web server running on port %s", port)
     web_log.info("Listening on http://%s:%s/ (health check route: GET /)", host, port)
+    if os.getenv("LOG_WEB_TOKEN"):
+        web_log.info("Web log viewer enabled at /logs?token=<LOG_WEB_TOKEN> (raw text: /logs/raw)")
+    else:
+        web_log.warning("Web log viewer disabled: set LOG_WEB_TOKEN in the environment to enable /logs")
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -92,6 +165,23 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 web_log = logging.getLogger("bot.web")
 discord_log = logging.getLogger("bot.discord")
+
+
+class WebLogBuffer(logging.Handler):
+    def __init__(self, capacity: int = 1000):
+        super().__init__()
+        self.records = deque(maxlen=capacity)
+
+    def emit(self, record):
+        try:
+            self.records.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+web_log_buffer = WebLogBuffer()
+web_log_buffer.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logging.getLogger().addHandler(web_log_buffer)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
