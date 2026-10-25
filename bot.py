@@ -8,6 +8,7 @@ import asyncio
 import threading
 import random
 import re
+import logging
 import subprocess
 from datetime import timedelta
 from collections import defaultdict, deque
@@ -26,12 +27,71 @@ def _ensure_packages():
 _ensure_packages()
 
 import aiohttp
+from aiohttp import web
+
+@web.middleware
+async def access_log_middleware(request, handler):
+    started = time.perf_counter()
+    remote = request.headers.get("X-Forwarded-For", request.remote)
+    agent = request.headers.get("User-Agent", "unknown")
+    try:
+        response = await handler(request)
+    except web.HTTPException as e:
+        web_log.warning("%s %s -> %s %s | from %s | UA: %s | %.1f ms", request.method, request.path_qs, e.status, e.reason, remote, agent, (time.perf_counter() - started) * 1000)
+        raise
+    except Exception:
+        web_log.exception("%s %s -> 500 | from %s | UA: %s | %.1f ms", request.method, request.path_qs, remote, agent, (time.perf_counter() - started) * 1000)
+        raise
+    web_log.info("%s %s -> %s | %s bytes | from %s | UA: %s | %.1f ms", request.method, request.path_qs, response.status, response.content_length, remote, agent, (time.perf_counter() - started) * 1000)
+    return response
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    if getattr(bot, "_web_server_started", False):
+        web_log.info("Web server already running, skipping duplicate start")
+        return
+    host = "0.0.0.0"
+    raw_port = os.getenv("PORT", "8080")
+    web_log.info("Starting web server (PORT env = %r)", raw_port)
+    try:
+        port = int(raw_port)
+    except ValueError:
+        web_log.error("Invalid PORT value %r, falling back to 8080", raw_port)
+        port = 8080
+    try:
+        app = web.Application(middlewares=[access_log_middleware])
+        app.router.add_get("/", handle_ping)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+    except OSError as e:
+        web_log.error("Failed to bind %s:%s - %s", host, port, e)
+        return
+    except Exception:
+        web_log.exception("Unexpected error while starting web server")
+        return
+    bot._web_server_started = True
+    web_log.info("Web server running on port %s", port)
+    web_log.info("Listening on http://%s:%s/ (health check route: GET /)", host, port)
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from groq import Groq
 
 load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)-12s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("bot")
+web_log = logging.getLogger("bot.web")
+discord_log = logging.getLogger("bot.discord")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -319,6 +379,54 @@ def is_admin():
     return commands.check(predicate)
 
 
+def _where(guild, channel) -> str:
+    if guild is None:
+        return "DM"
+    return f"{guild.name} ({guild.id}) #{getattr(channel, 'name', channel.id)}"
+
+
+def _short(text: str, limit: int = 200) -> str:
+    text = text.replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+@bot.event
+async def on_connect():
+    discord_log.info("Connected to Discord gateway")
+
+
+@bot.event
+async def on_disconnect():
+    discord_log.warning("Disconnected from Discord gateway")
+
+
+@bot.event
+async def on_resumed():
+    discord_log.info("Gateway session resumed")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    discord_log.info("Joined guild %s (ID: %s) | members: %s | total guilds: %s", guild.name, guild.id, guild.member_count, len(bot.guilds))
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    discord_log.warning("Removed from guild %s (ID: %s) | total guilds: %s", guild.name, guild.id, len(bot.guilds))
+
+
+@bot.event
+async def on_command(ctx: commands.Context):
+    ctx.command_started = time.perf_counter()
+    discord_log.info("Command !%s by %s (ID: %s) in %s | message: %s", ctx.command.qualified_name, ctx.author, ctx.author.id, _where(ctx.guild, ctx.channel), _short(ctx.message.content))
+
+
+@bot.event
+async def on_command_completion(ctx: commands.Context):
+    elapsed = time.perf_counter() - getattr(ctx, "command_started", time.perf_counter())
+    discord_log.info("Command !%s by %s (ID: %s) completed in %.2fs", ctx.command.qualified_name, ctx.author, ctx.author.id, elapsed)
+
+
 @bot.before_invoke
 async def _track_command_usage(ctx: commands.Context):
     if ctx.command is None:
@@ -344,6 +452,7 @@ _AI_COMMAND_WORD = AI_PREFIX[1:].split()[0].lower() if AI_PREFIX.startswith("!")
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    discord_log.warning("Command error: !%s by %s (ID: %s) in %s | %s: %s", ctx.command or ctx.invoked_with, ctx.author, ctx.author.id, _where(ctx.guild, ctx.channel), type(error).__name__, error)
     if isinstance(error, commands.CommandNotFound):
         attempted = (ctx.invoked_with or "").lower()
         if attempted == _AI_COMMAND_WORD:
@@ -361,7 +470,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
         await ctx.send(t(ctx.channel.id, "cmd_bad_syntax", command=ctx.command))
         return
-    print(f"⚠️ Unhandled error in !{ctx.command}: {type(error).__name__}: {error}")
+    discord_log.error("Unhandled error in !%s by %s (ID: %s)", ctx.command, ctx.author, ctx.author.id, exc_info=error)
     await ctx.send(t(ctx.channel.id, "cmd_generic_error"))
 
 
@@ -707,7 +816,11 @@ def terminal_input_loop(loop: asyncio.AbstractEventLoop):
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    await start_web_server()
+    discord_log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    discord_log.info("Connected to %s guild(s) | %s cached user(s) | latency %sms", len(bot.guilds), len(bot.users), round(bot.latency * 1000))
+    for guild in bot.guilds:
+        discord_log.info("Guild: %s (ID: %s) | members: %s", guild.name, guild.id, guild.member_count)
 
     if not getattr(bot, "_terminal_thread_started", False):
         bot._terminal_thread_started = True
@@ -4518,10 +4631,14 @@ async def on_message(message: discord.Message):
             await message.channel.send(t(message.channel.id, "ai_empty_prompt"))
             return
 
+        discord_log.info("AI request from %s (ID: %s) in %s via %s | prompt: %s", message.author, message.author.id, _where(message.guild, message.channel), "prefix" if is_ai_prefix else "mention", _short(user_text))
         async with message.channel.typing():
+            ai_started = time.perf_counter()
             try:
                 reply = await ask_groq(message.channel.id, user_text)
+                discord_log.info("AI reply ready in %.2fs (%s chars) for channel %s", time.perf_counter() - ai_started, len(reply), message.channel.id)
             except Exception as e:
+                discord_log.error("AI call failed after %.2fs in channel %s", time.perf_counter() - ai_started, message.channel.id, exc_info=True)
                 reply = f"⚠️ Error calling the AI: {e}"
 
         await message.channel.send(reply)
@@ -5602,4 +5719,4 @@ async def economyfix_error(ctx: commands.Context, error: commands.CommandError):
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN, log_handler=None)
